@@ -77,6 +77,10 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     description:
       "Spawn an agent for a concrete, bounded subtask. The child gets a canonical path, independent context, shared filesystem, the same active tools, and recursive delegation tools.",
     promptSnippet: "Spawn a child agent for independent parallel work",
+    promptGuidelines: [
+      "Only spawn agents when there is a good reason to do so, not simply because you can.",
+      "When spawning an agent with a different model or reasoning effort, you cannot use `fork_turns: all`, you must use none or choose a number of turns."
+    ],
     parameters: Type.Object(
       {
         task_name: Type.String({ description: "Lowercase letters, digits, and underscores" }),
