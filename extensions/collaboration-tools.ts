@@ -14,6 +14,17 @@ function toolResult<T>(value: T) {
   };
 }
 
+/** Uses TeamManager's stable per-agent color when available, with a test/mock fallback. */
+function formatAgentName(team: TeamManager, path: string, restoreAnsi?: string): string {
+  const formatter = (team as TeamManager & { formatAgentName?: (path: string, restoreAnsi?: string) => string }).formatAgentName;
+  return formatter ? formatter.call(team, path, restoreAnsi) : `\`${path}\``;
+}
+
+/** Returns a theme background ANSI sequence when available. */
+function bgAnsi(theme: { getBgAnsi?: (color: "toolSuccessBg") => string }, color: "toolSuccessBg"): string | undefined {
+  return theme.getBgAnsi?.(color);
+}
+
 /** Creates collaboration tools bound to one sending agent. */
 export function createCollaborationTools(team: TeamManager, source: string): ToolDefinition[] {
   /** Spawns a child agent with an independent context. */
@@ -23,7 +34,6 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     description:
       "Spawn an agent for a concrete, bounded subtask. The child gets a canonical path, independent context, shared filesystem, the same active tools, and recursive delegation tools.",
     promptSnippet: "Spawn a child agent for independent parallel work",
-    renderShell: "self",
     parameters: Type.Object(
       {
         task_name: Type.String({ description: "Lowercase letters, digits, and underscores" }),
@@ -47,11 +57,10 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     renderResult(result, _options, theme, context) {
       if (context.isError) {
         const error = result.content.find((part) => part.type === "text")?.text ?? "Unknown error";
-        return new Text(`${theme.fg("error", "• Agent spawn failed")}\n${theme.fg("muted", `  └ ${error}`)}`, 0, 0);
+        return new Text(`${theme.fg("error", "Agent spawn failed")}\n${theme.fg("muted", `└ ${error}`)}`, 0, 0);
       }
       const path = (result.details as { task_name?: string } | undefined)?.task_name ?? context.args.task_name;
-      const title = theme.fg("muted", "• ") + theme.fg("toolTitle", theme.bold("Started ")) + theme.fg("accent", `\`${path}\``);
-      return new Text(title, 0, 0);
+      return new Text(`${theme.fg("toolTitle", theme.bold("Started "))}${formatAgentName(team, path, bgAnsi(theme, "toolSuccessBg"))}`, 0, 0);
     },
   });
 
@@ -61,12 +70,21 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     label: "Send Message",
     description: "Queue a message for an existing agent. It does not start a new turn for an idle agent.",
     promptSnippet: "Send information to a running agent without waking an idle one",
+    renderShell: "self",
     parameters: Type.Object(
       { target: Type.String({ description: "Relative child name or canonical task path" }), message: Type.String() },
       { additionalProperties: false },
     ),
     async execute(_id, params) {
       return toolResult(await team.sendMessage(source, params.target, params.message));
+    },
+    renderCall() {
+      return new Container();
+    },
+    renderResult(result, _options, theme, context) {
+      if (context.isError) return new Text(theme.fg("error", "• Message failed"), 0, 0);
+      const target = (result.details as { target?: string } | undefined)?.target ?? context.args.target;
+      return new Text(`${theme.fg("muted", "• Sent message to ")}${formatAgentName(team, target)}`, 0, 0);
     },
   });
 
@@ -76,12 +94,21 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     label: "Follow-up Task",
     description: "Give an existing non-root agent another task, starting it if idle or steering it if running.",
     promptSnippet: "Give an existing agent more work and trigger its turn",
+    renderShell: "self",
     parameters: Type.Object(
       { target: Type.String({ description: "Relative child name or canonical task path" }), message: Type.String() },
       { additionalProperties: false },
     ),
     async execute(_id, params) {
       return toolResult(await team.followup(source, params.target, params.message));
+    },
+    renderCall() {
+      return new Container();
+    },
+    renderResult(result, _options, theme, context) {
+      if (context.isError) return new Text(theme.fg("error", "• Follow-up failed"), 0, 0);
+      const target = (result.details as { target?: string } | undefined)?.target ?? context.args.target;
+      return new Text(`${theme.fg("muted", "• Follow-up queued for ")}${formatAgentName(team, target)}`, 0, 0);
     },
   });
 
@@ -136,12 +163,21 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
     label: "Interrupt Agent",
     description: "Interrupt a spawned agent's current turn while preserving its context for future follow-up tasks.",
     promptSnippet: "Stop a child agent's current turn without deleting it",
+    renderShell: "self",
     parameters: Type.Object(
       { target: Type.String({ description: "Relative child name or canonical task path" }) },
       { additionalProperties: false },
     ),
     async execute(_id, params) {
       return toolResult(await team.interrupt(source, params.target));
+    },
+    renderCall() {
+      return new Container();
+    },
+    renderResult(result, _options, theme, context) {
+      if (context.isError) return new Text(theme.fg("error", "• Interrupt failed"), 0, 0);
+      const target = (result.details as { target?: string } | undefined)?.target ?? context.args.target;
+      return new Text(`${theme.fg("muted", "• Interrupted ")}${formatAgentName(team, target)}`, 0, 0);
     },
   });
 

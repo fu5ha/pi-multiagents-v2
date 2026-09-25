@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
+import type { Component } from "@earendil-works/pi-tui";
 import {
   type AgentSession,
   createAgentSession,
@@ -43,6 +44,13 @@ const SELF_PATH = safeRealpath(fileURLToPath(new URL("./index.ts", import.meta.u
 const MAX_CHILD_RUNS = positiveInteger(process.env.PI_MULTIAGENTS_MAX_CONCURRENCY, 8);
 /** Pi custom-message type used for agent mail. */
 const MAIL_TYPE = "pi-multiagents-v2-message";
+/** Stable key for the persistent multi-agent UI surface. */
+const UI_KEY = "pi-multiagents-v2";
+/** Maximum widget lines; Pi may truncate longer widgets. */
+const MAX_WIDGET_LINES = 8;
+/** 256-color ANSI background colors assigned to agents when they are created. */
+const AGENT_COLORS = [27, 34, 93, 201, 51, 208, 129, 46, 15, 33, 165, 220] as const;
+type AgentColor = (typeof AGENT_COLORS)[number];
 
 /** Creates a named child session with the parent's persistence policy. */
 export function createChildSessionManager(
@@ -74,6 +82,7 @@ interface AgentNode {
   parent: string | null;
   session?: AgentSession;
   status: AgentStatus;
+  color: AgentColor;
   pendingTasks: string[];
   queued: boolean;
   running: boolean;
@@ -132,6 +141,13 @@ export class TeamManager {
   private activeChildRuns = 0;
   private disposed = false;
   private projectTrusted = false;
+  private ui?: ExtensionContext["ui"];
+  private panelPinned = false;
+  private panelPopupActive = false;
+  private panelPopupTimer?: NodeJS.Timeout;
+  private uiMode?: ExtensionContext["mode"];
+  private tuiWidgetRegistered = false;
+  private nextColorIndex = 0;
   private readonly pi: ExtensionAPI;
 
   /** Creates a team rooted at `/root`. */
@@ -144,14 +160,38 @@ export class TeamManager {
   start(ctx: ExtensionContext): void {
     this.cwd = ctx.cwd;
     this.projectTrusted = ctx.isProjectTrusted();
+    this.ui = ctx.hasUI ? ctx.ui : undefined;
+    this.uiMode = ctx.hasUI ? ctx.mode : undefined;
+    this.tuiWidgetRegistered = false;
+    if (this.ui && this.uiMode === "tui") {
+      this.ui.setWidget(UI_KEY, () => this.createTuiWidget());
+      this.tuiWidgetRegistered = true;
+    }
     const root = this.requireNode(ROOT);
     root.status = { completed: null };
+    this.refreshUi();
   }
 
   /** Updates the root agent's externally visible status. */
   setRootStatus(status: AgentStatus): void {
     const root = this.nodes.get(ROOT);
     if (root) root.status = status;
+    this.refreshUi();
+  }
+
+  /** Toggles whether the multi-agent panel stays visible between status-change popups. */
+  togglePanel(): boolean {
+    this.panelPinned = !this.panelPinned;
+    this.refreshUi();
+    return this.panelPinned;
+  }
+
+  /** Formats an agent path/name with its assigned color for text-based UI. */
+  formatAgentName(path: string, restoreAnsi = "\x1b[0m"): string {
+    const node = this.nodes.get(path);
+    const names = path.split("/").filter(Boolean);
+    const name = names[names.length - 1] ?? path;
+    return node ? this.ansiBg(node.color, ` ${name} `, restoreAnsi) : name;
   }
 
   /** Wakes root waiters when user input steers the current turn. */
@@ -165,6 +205,7 @@ export class TeamManager {
       path,
       parent,
       status: "pending_init",
+      color: AGENT_COLORS[this.nextColorIndex++ % AGENT_COLORS.length],
       pendingTasks: [],
       queued: false,
       running: false,
@@ -314,6 +355,7 @@ export class TeamManager {
       node.status = "pending_init";
       this.runQueue.push(node);
     }
+    this.refreshUi(true);
     this.pump();
   }
 
@@ -334,6 +376,7 @@ export class TeamManager {
     node.running = true;
     node.status = "running";
     this.activeChildRuns++;
+    this.refreshUi(true);
     try {
       await node.session!.prompt(task, { expandPromptTemplates: false });
       if (node.interrupted) {
@@ -362,6 +405,7 @@ export class TeamManager {
         node.queued = true;
         this.runQueue.push(node);
       }
+      this.refreshUi(true);
       this.pump();
     }
   }
@@ -437,7 +481,8 @@ export class TeamManager {
     node.session!.clearQueue();
     if (node.running) await node.session!.abort();
     node.status = "interrupted";
-    return { previous_status: previousStatus };
+    this.refreshUi(true);
+    return { target: node.path, previous_status: previousStatus };
   }
 
   /** Waits for mailbox activity, steering input, or timeout. */
@@ -486,6 +531,142 @@ export class TeamManager {
     node.waiters.clear();
   }
 
+  /** Converts a node status into compact UI metadata. */
+  private describeStatus(status: AgentStatus): { icon: string; label: string; rank: number } {
+    if (status === "running") return { icon: "⏳", label: "running", rank: 0 };
+    if (status === "pending_init") return { icon: "…", label: "pending", rank: 1 };
+    if (status === "interrupted") return { icon: "■", label: "interrupted", rank: 3 };
+    if (status === "shutdown") return { icon: "", label: "shutdown", rank: 5 };
+    if (status === "not_found") return { icon: "?", label: "not found", rank: 4 };
+    if ("errored" in status) return { icon: "✗", label: "errored", rank: 2 };
+    return { icon: "✓", label: "completed", rank: 4 };
+  }
+
+  /** Updates the persistent TUI/RPC-friendly widget and footer status. */
+  private refreshUi(popUp = false): void {
+    if (!this.ui) return;
+
+    const children = this.visibleChildren();
+    if (children.length === 0) {
+      this.clearUi();
+      return;
+    }
+
+    if (popUp) this.showPanelTemporarily();
+    const visible = this.panelPinned || this.panelPopupActive;
+
+    if (this.uiMode === "tui" && this.tuiWidgetRegistered) {
+      // The TUI widget is registered once and renders from live TeamManager state with the exact width Pi provides.
+      // setStatus(undefined) requests a render without leaving a footer/below-editor status label behind.
+      this.ui.setStatus(UI_KEY, undefined);
+      return;
+    }
+
+    this.ui.setWidget(UI_KEY, visible ? this.widgetLines(100) : undefined);
+    this.ui.setStatus(UI_KEY, undefined);
+  }
+
+  /** Creates a TUI widget that receives the real available width from Pi at render time. */
+  private createTuiWidget(): Component {
+    return {
+      render: (width: number) => (this.panelPinned || this.panelPopupActive ? this.widgetLines(width) : []),
+      invalidate: () => undefined,
+    };
+  }
+
+  /** Returns non-root nodes displayed in the panel. */
+  private visibleChildren(): AgentNode[] {
+    return [...this.nodes.values()].filter((node) => node.path !== ROOT && node.status !== "shutdown");
+  }
+
+  /** Builds widget lines for a known render width. */
+  private widgetLines(width: number): string[] {
+    const sorted = this.visibleChildren().sort((a, b) => {
+      const rank = this.describeStatus(a.status).rank - this.describeStatus(b.status).rank;
+      return rank || a.path.localeCompare(b.path);
+    });
+    const contentWidth = Math.max(20, width - 2);
+    return [this.separatorLine(contentWidth), ...this.agentChipLines(sorted, contentWidth, MAX_WIDGET_LINES - 1)];
+  }
+
+  /** Makes the panel visible briefly even when the user has not pinned it on. */
+  private showPanelTemporarily(): void {
+    this.panelPopupActive = true;
+    if (this.panelPopupTimer) clearTimeout(this.panelPopupTimer);
+    this.panelPopupTimer = setTimeout(() => {
+      this.panelPopupActive = false;
+      this.panelPopupTimer = undefined;
+      this.refreshUi();
+    }, 5_000);
+    this.panelPopupTimer.unref?.();
+  }
+
+  /** Builds horizontal, wrapped child-agent chips. */
+  private agentChipLines(nodes: AgentNode[], maxLineLength: number, maxLines: number): string[] {
+    const lines: string[] = [];
+    let line = "";
+    let emitted = 0;
+    for (const node of nodes) {
+      const chip = this.agentChip(node);
+      const plainLength = this.plainTextLength(line) + (line ? 2 : 0) + this.plainTextLength(chip);
+      if (line && plainLength > maxLineLength) {
+        lines.push(line);
+        line = "";
+      }
+      if (lines.length >= maxLines) break;
+      line = line ? `${line}  ${chip}` : chip;
+      emitted++;
+    }
+    if (line && lines.length < maxLines) lines.push(line);
+    const hidden = nodes.length - emitted;
+    if (hidden > 0 && lines.length > 0) lines[lines.length - 1] += `  +${hidden} more`;
+    return lines;
+  }
+
+  /** Formats one child agent as a colored chip. */
+  private agentChip(node: AgentNode): string {
+    const status = this.describeStatus(node.status);
+    const names = node.path.split("/").filter(Boolean);
+    const name = names[names.length - 1] ?? node.path;
+    return `${status.icon} ${this.ansiBg(node.color, ` ${name} `)}`;
+  }
+
+  /** Applies a standard 256-color ANSI background to a chip. */
+  private ansiBg(color: AgentColor, text: string, restoreAnsi = "\x1b[0m"): string {
+    const foreground = color === 15 || color === 220 ? 16 : 15;
+    return `\x1b[48;5;${color}m\x1b[38;5;${foreground}m${text}\x1b[39m${restoreAnsi}`;
+  }
+
+  /** Builds a full-width separator with a compact label. */
+  private separatorLine(width: number): string {
+    const theme = this.ui!.theme;
+    const label = " multiagents ";
+    const left = "─".repeat(Math.max(2, Math.floor((width - label.length) / 2)));
+    const right = "─".repeat(Math.max(2, width - label.length - left.length));
+    return theme.fg("borderMuted", `${left}${label}${right}`);
+  }
+
+  /** Approximate visible length by stripping ANSI escape sequences. */
+  private plainTextLength(value: string): number {
+    return value.replace(/\x1b\[[0-9;]*m/g, "").length;
+  }
+
+  /** Clears the persistent multi-agent UI surface. */
+  private clearUi(removeWidget = false): void {
+    if (removeWidget || this.uiMode !== "tui") {
+      this.ui?.setWidget(UI_KEY, undefined);
+      this.tuiWidgetRegistered = false;
+    }
+    this.ui?.setStatus(UI_KEY, undefined);
+  }
+
+  /** Cancels any pending temporary panel hide/show timer. */
+  private cancelPanelPopup(): void {
+    if (this.panelPopupTimer) clearTimeout(this.panelPopupTimer);
+    this.panelPopupTimer = undefined;
+    this.panelPopupActive = false;
+  }
+
   /** Creates collaboration tools bound to a child identity. */
   private createTools(source: string) {
     return createCollaborationTools(this, source);
@@ -510,6 +691,8 @@ export class TeamManager {
       ),
     );
     for (const node of children) node.status = "shutdown";
+    this.cancelPanelPopup();
+    this.clearUi(true);
   }
 }
 

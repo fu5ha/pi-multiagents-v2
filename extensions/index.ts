@@ -22,6 +22,13 @@ Payload:
 export default function subagentsV2(pi: ExtensionAPI) {
   const team = new TeamManager(pi);
   for (const tool of createCollaborationTools(team, ROOT)) pi.registerTool(tool);
+  pi.registerCommand("multiagents", {
+    description: "Toggle the persistent multi-agent status panel",
+    async handler(_args, ctx) {
+      const pinned = team.togglePanel();
+      if (ctx.hasUI) ctx.ui.notify(`Multi-agent panel ${pinned ? "pinned" : "hidden between updates"}`, "info");
+    },
+  });
 
   pi.on("session_start", (_event, ctx) => team.start(ctx));
   pi.on("before_agent_start", (event) => ({

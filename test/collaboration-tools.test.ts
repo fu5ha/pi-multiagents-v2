@@ -19,7 +19,7 @@ test("Codex-style spawn rendering", () => {
     message: "Find the root cause.",
   };
 
-  assert.equal(spawn.renderShell, "self");
+  assert.equal(spawn.renderShell, undefined);
   assert.deepEqual(render(spawn.renderCall!(args, theme, context(false, args))), []);
   assert.deepEqual(
     render(
@@ -33,7 +33,7 @@ test("Codex-style spawn rendering", () => {
         context(false, args),
       ),
     ),
-    ["• Started `/root/root_cause_242`"],
+    ["Started `/root/root_cause_242`"],
   );
   assert.deepEqual(
     render(
@@ -44,7 +44,7 @@ test("Codex-style spawn rendering", () => {
         context(true, args),
       ),
     ),
-    ["• Agent spawn failed", '  └ Full-history forks inherit model; use fork_turns="none"'],
+    ["Agent spawn failed", '└ Full-history forks inherit model; use fork_turns="none"'],
   );
 });
 
