@@ -84,7 +84,8 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
       "For coding work, prefer a bounded implementation task over read-only exploration when the child can safely make the change. Give agents disjoint write scopes, tell them to edit files directly, and ask them to list changed paths in their final answer.",
       "After delegating, immediately continue meaningful non-overlapping work if any exists. Do not redo the delegated task, use wait_agent only when its result blocks the next critical-path step, and review returned changes before integrating them.",
       "Parallelize distinct independent questions or disjoint implementation slices, and delegate verification only when it can overlap implementation and is likely to catch a concrete risk.",
-      "Omitting `fork_turns` defaults to `all` and passes all surrounding context. Be careful of this when there is already a lot of context in the current thread. Use `none` and explicitly pass through links to needed context in these situations.",
+      "Omitting `fork_turns` defaults to `all` and passes all surrounding context. Be careful of this when there is already a lot of context in the current thread. Use `none` and explicitly pass through the needed context seed in these situations.",
+      "When `fork_turns` is not `all`, the child agent will automatically get the parent's session id, the tool call id of the spawn, and instructions to use those to find more parent session context if desired.",
       "Full-history forks inherit the parent model and reasoning effort. To override either, you must set `fork_turns` to `none` or a positive integer string, not `all` or default.",
     ],
     parameters: Type.Object(
@@ -101,8 +102,8 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
       { additionalProperties: false },
     ),
     executionMode: "sequential",
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return toolResult(await team.spawn(source, params, ctx));
+    async execute(id, params, _signal, _onUpdate, ctx) {
+      return toolResult(await team.spawn(source, params, ctx, id));
     },
     renderCall(args, theme, context) {
       let text = theme.fg("toolTitle", theme.bold("spawn_agent ")) + theme.fg("accent", args.task_name);

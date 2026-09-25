@@ -130,13 +130,53 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | null {
   return null;
 }
 
+interface ParentContextReference {
+  sessionId: string;
+  messageId: string | null;
+}
+
+/** Returns the parent session entry immediately before the assistant turn containing a spawn call. */
+function parentContextReference(
+  sessionManager: Pick<SessionManager, "getSessionId" | "getBranch" | "getLeafId">,
+  toolCallId: string,
+): ParentContextReference {
+  const branch = sessionManager.getBranch();
+  const spawnIndex = branch.findLastIndex((entry) => {
+    if (entry.type !== "message" || entry.message.role !== "assistant" || !Array.isArray(entry.message.content)) {
+      return false;
+    }
+    return entry.message.content.some(
+      (part) => part.type === "toolCall" && part.id === toolCallId && part.name === "spawn_agent",
+    );
+  });
+  return {
+    sessionId: sessionManager.getSessionId(),
+    messageId: spawnIndex >= 0 ? branch[spawnIndex].parentId : sessionManager.getLeafId(),
+  };
+}
+
 /** Builds identity and collaboration guidance for a child agent. */
-function subagentInstructions(path: string, parent: string, role?: string): string {
+function subagentInstructions(
+  path: string,
+  parent: string,
+  role?: string,
+  parentContext?: ParentContextReference,
+): string {
+  const contextGuidance = parentContext
+    ? `
+Parent context reference (for omitted history):
+- session_id: ${parentContext.sessionId}
+- message_id: ${parentContext.messageId ?? "null"}
+
+To recover omitted parent context, recursively find the JSONL file ending in \`_${parentContext.sessionId}.jsonl\` under \`~/.pi/agent/sessions/\` (or the configured \`sessionDir\` / \`PI_CODING_AGENT_SESSION_DIR\`), locate the entry whose \`id\` equals \`${parentContext.messageId ?? "null"}\`, and follow its \`parentId\` chain only as far back as needed. Pi session format: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md
+If no matching JSONL exists, the parent was likely an in-memory sub-agent session, or was otherwise explicitly configured as an in-memory session, so its omitted context cannot be recovered from disk.
+`
+    : "";
   return `
 You are ${path}, an agent in a team collaborating on the user's task. Your direct parent is ${parent}.${role ? ` Your requested agent type is ${role}.` : ""}
 You have an independent context window but share the same working directory and filesystem with every agent. You may spawn children with spawn_agent. Use disjoint write scopes and tell your parent which files you changed.
 Use send_message for information that should not wake an idle agent and followup_task for new work that should start a turn. Your final response is automatically delivered to ${parent}; do not repeatedly poll or resend it.
-Incoming team messages use NEW_TASK, MESSAGE, or FINAL_ANSWER envelopes. Canonical task names begin at /root.`;
+Incoming team messages use NEW_TASK, MESSAGE, or FINAL_ANSWER envelopes. Canonical task names begin at /root.${contextGuidance}`;
 }
 
 /** Owns agent sessions, scheduling, messaging, and lifecycle state. */
@@ -264,7 +304,7 @@ export class TeamManager {
   }
 
   /** Creates and schedules a child agent session. */
-  async spawn(source: string, params: SpawnParams, ctx: ExtensionContext) {
+  async spawn(source: string, params: SpawnParams, ctx: ExtensionContext, toolCallId: string) {
     if (this.disposed) throw new Error("Agent team is shutting down");
     const path = childPath(source, params.task_name);
     if (this.nodes.has(path) || this.reservedPaths.has(path)) {
@@ -275,6 +315,10 @@ export class TeamManager {
     if (forkMode === "all" && (params.model || params.reasoning_effort)) {
       throw new Error('Full-history forks inherit model and reasoning; use fork_turns="none" or a number for overrides');
     }
+    const sourceSessionManager =
+      source === ROOT ? ctx.sessionManager : this.requireNode(source).session!.sessionManager;
+    const parentContext =
+      forkMode === "all" ? undefined : parentContextReference(sourceSessionManager, toolCallId);
 
     this.reservedPaths.add(path);
     try {
@@ -291,11 +335,7 @@ export class TeamManager {
       if (!model) throw new Error("No model is available for the child agent");
 
       const forkedMessages = selectForkMessages(this.sourceMessages(source, ctx), params.fork_turns);
-      const sessionManager = createChildSessionManager(
-        this.cwd,
-        source === ROOT ? ctx.sessionManager : this.requireNode(source).session!.sessionManager,
-        path,
-      );
+      const sessionManager = createChildSessionManager(this.cwd, sourceSessionManager, path);
       for (const message of structuredClone(forkedMessages)) {
         sessionManager.appendMessage(message as Parameters<SessionManager["appendMessage"]>[0]);
       }
@@ -317,7 +357,7 @@ export class TeamManager {
         }),
         appendSystemPromptOverride: (base) => [
           ...base,
-          subagentInstructions(path, source, params.agent_type?.trim() || undefined),
+          subagentInstructions(path, source, params.agent_type?.trim() || undefined, parentContext),
         ],
       });
       await loader.reload();
