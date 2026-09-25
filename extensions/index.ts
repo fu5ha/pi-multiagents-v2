@@ -1,8 +1,9 @@
 /** Pi extension entrypoint that wires Multi-Agent V2 tools and lifecycle hooks. */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { createCollaborationTools } from "./collaboration-tools.ts";
-import { createChildSessionManager, ROOT, TeamManager } from "./team-manager.ts";
+import { createChildSessionManager, MAIL_TYPE, type MailDetails, ROOT, TeamManager } from "./team-manager.ts";
 
 export { createChildSessionManager, TeamManager };
 
@@ -18,10 +19,53 @@ Sender: <author>
 Payload:
 <payload text>`;
 
+/** Converts message content to a safe renderer fallback. */
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((part) =>
+      part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part
+        ? [String(part.text)]
+        : [],
+    )
+    .join("\n");
+}
+
+/** Creates a compact single-line payload preview. */
+function payloadPreview(payload: string, limit = 120): string {
+  const singleLine = payload.replace(/\s+/g, " ").trim();
+  return singleLine.length > limit ? `${singleLine.slice(0, limit - 1)}…` : singleLine;
+}
+
 /** Registers Multi-Agent V2 tools and lifecycle hooks. */
 export default function subagentsV2(pi: ExtensionAPI) {
   const team = new TeamManager(pi);
   for (const tool of createCollaborationTools(team, ROOT)) pi.registerTool(tool);
+  pi.registerMessageRenderer<MailDetails>(MAIL_TYPE, (message, { expanded, outputPad }, theme) => {
+    const details = message.details;
+    const source = details?.source ?? "unknown";
+    const target = details?.target ?? "unknown";
+    const type = details?.type ?? "MESSAGE";
+    const payload = details?.payload ?? messageText(message.content);
+    const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
+    if (!expanded) {
+      const preview = payloadPreview(payload) || "(empty message)";
+      const route = theme.fg("muted", `${source} → ${target}`);
+      const icon = theme.fg("customMessageLabel", theme.bold("✉"));
+      const label = theme.fg("customMessageLabel", theme.bold(type));
+      box.addChild(new Text(`${icon} ${route} ${label}: ${theme.fg("customMessageText", preview)}`, 0, 0));
+      return box;
+    }
+    box.addChild(
+      new Text(
+        `${theme.fg("customMessageLabel", theme.bold("Inter-agent message"))}\n${theme.fg("muted", `Type: ${type}`)}\n${theme.fg("muted", `From: ${source}`)}\n${theme.fg("muted", `To: ${target}`)}\n\n${theme.fg("customMessageText", payload)}`,
+        0,
+        0,
+      ),
+    );
+    return box;
+  });
   pi.registerCommand("multiagents", {
     description: "Toggle the persistent multi-agent status panel",
     async handler(_args, ctx) {

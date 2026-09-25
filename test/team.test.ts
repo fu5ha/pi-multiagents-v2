@@ -13,6 +13,11 @@ test("root lifecycle and mailbox wake-up", async () => {
   assert.deepEqual(team.list("/root"), {
     agents: [{ agent_name: "/root", agent_status: { completed: null } }],
   });
+  assert.deepEqual(team.waitSummary("/root", 0), {
+    waiting_agent: "/root",
+    waited_on: [],
+    timeout_ms: 100,
+  });
 
   const waiting = team.wait("/root", 1_000, undefined);
   team.signalRootSteer();
@@ -68,10 +73,10 @@ test("child sessions follow parent persistence", async () => {
   }
 });
 
-test("root mailbox stays model-visible but hidden from the transcript", async () => {
-  const sent: Array<{ message: { content: unknown; display: boolean }; options: unknown }> = [];
+test("root mailbox stays model-visible and visible in the transcript", async () => {
+  const sent: Array<{ message: { content: unknown; display: boolean; details?: unknown }; options: unknown }> = [];
   const pi = {
-    sendMessage(message: { content: unknown; display: boolean }, options: unknown) {
+    sendMessage(message: { content: unknown; display: boolean; details?: unknown }, options: unknown) {
       sent.push({ message, options });
     },
   } as unknown as ExtensionAPI;
@@ -81,7 +86,13 @@ test("root mailbox stays model-visible but hidden from the transcript", async ()
   await team.sendMessage("/root/worker", "/root", "done");
 
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].message.display, false);
+  assert.equal(sent[0].message.display, true);
+  assert.deepEqual(sent[0].message.details, {
+    source: "/root/worker",
+    target: "/root",
+    type: "MESSAGE",
+    payload: "done",
+  });
   assert.match(String(sent[0].message.content), /Sender: \/root\/worker/);
   await team.dispose();
 });

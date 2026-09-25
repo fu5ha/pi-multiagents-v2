@@ -20,7 +20,10 @@ test("Codex-style spawn rendering", () => {
   };
 
   assert.equal(spawn.renderShell, undefined);
-  assert.deepEqual(render(spawn.renderCall!(args, theme, context(false, args))), []);
+  assert.deepEqual(render(spawn.renderCall!(args, theme, context(false, args))), [
+    "spawn_agent root_cause_242",
+    "Find the root cause.",
+  ]);
   assert.deepEqual(
     render(
       spawn.renderResult!(
@@ -33,7 +36,7 @@ test("Codex-style spawn rendering", () => {
         context(false, args),
       ),
     ),
-    ["Started `/root/root_cause_242`"],
+    ["", "Started `/root/root_cause_242`"],
   );
   assert.deepEqual(
     render(
@@ -44,30 +47,144 @@ test("Codex-style spawn rendering", () => {
         context(true, args),
       ),
     ),
-    ["Agent spawn failed", '└ Full-history forks inherit model; use fork_turns="none"'],
+    ["", "Failed to start agent", 'Full-history forks inherit model; use fork_turns="none"'],
   );
 });
 
-test("Codex-style list and wait rendering", () => {
+test("message, follow-up, and interrupt use standard Pi tool blocks", () => {
+  const tools = createCollaborationTools({} as TeamManager, "/root");
+  const cases = [
+    {
+      name: "send_message",
+      args: { target: "/root/a", message: "hello" },
+      details: { target: "/root/a", queued: true },
+      call: ["send_message /root/a", "hello"],
+      result: ["", "Sent to `/root/a`"],
+    },
+    {
+      name: "followup_task",
+      args: { target: "/root/a", message: "continue" },
+      details: { target: "/root/a", status: "running" },
+      call: ["followup_task /root/a", "continue"],
+      result: ["", "Queued for `/root/a`"],
+    },
+    {
+      name: "interrupt_agent",
+      args: { target: "/root/a" },
+      details: { target: "/root/a", previous_status: "running" },
+      call: ["interrupt_agent /root/a"],
+      result: ["", "Interrupted `/root/a`"],
+    },
+  ];
+
+  for (const item of cases) {
+    const tool = tools.find((candidate) => candidate.name === item.name)!;
+    assert.equal(tool.renderShell, undefined);
+    assert.deepEqual(render(tool.renderCall!(item.args as any, theme, context(false, item.args))), item.call);
+    assert.deepEqual(
+      render(
+        tool.renderResult!(
+          { content: [{ type: "text", text: "ok" }], details: item.details },
+          { expanded: false, isPartial: false },
+          theme,
+          context(false, item.args),
+        ),
+      ),
+      item.result,
+    );
+    assert.deepEqual(
+      render(
+        tool.renderResult!(
+          { content: [{ type: "text", text: "Specific failure" }], details: undefined },
+          { expanded: false, isPartial: false },
+          theme,
+          context(true, item.args),
+        ),
+      ),
+      ["", "Specific failure"],
+    );
+  }
+});
+
+test("compact and expanded list rendering", () => {
   const tools = createCollaborationTools({} as TeamManager, "/root");
   const list = tools.find((tool) => tool.name === "list_agents")!;
-  const wait = tools.find((tool) => tool.name === "wait_agent")!;
+  const result = {
+    content: [],
+    details: {
+      agents: [
+        { agent_name: "/root/a", agent_status: "running" },
+        { agent_name: "/root/b", agent_status: "pending_init" },
+        { agent_name: "/root/c", agent_status: { completed: "Full result" } },
+        { agent_name: "/root/d", agent_status: { errored: "Broken" } },
+        { agent_name: "/root/e", agent_status: "interrupted" },
+      ],
+    },
+  } as any;
 
-  assert.equal(list.renderShell, "self");
-  assert.deepEqual(render(list.renderCall!({}, theme, context())), []);
+  assert.equal(list.renderShell, undefined);
+  assert.deepEqual(render(list.renderCall!({}, theme, context())), ["list_agents"]);
   assert.deepEqual(
-    render(list.renderResult!({ content: [], details: undefined }, { expanded: false, isPartial: false }, theme, context())),
-    [],
+    render(list.renderResult!(result, { expanded: false, isPartial: false }, theme, context())),
+    ["", "1 done, 2 running, 1 failed", "⏳ /root/a", "… /root/b", "✓ /root/c", "(+2 more)"],
   );
-
-  assert.equal(wait.renderShell, "self");
-  assert.deepEqual(render(wait.renderCall!({}, theme, context())), ["• Waiting for agents"]);
   assert.deepEqual(
-    render(wait.renderResult!({ content: [], details: undefined }, { expanded: false, isPartial: false }, theme, context())),
-    ["", "• Finished waiting"],
+    render(list.renderResult!(result, { expanded: true, isPartial: false }, theme, context())),
+    [
+      "",
+      "1 done, 2 running, 1 failed",
+      "⏳ /root/a — running",
+      "… /root/b — pending",
+      "✓ /root/c — completed",
+      "  Full result",
+      "✗ /root/d — failed",
+      "  Broken",
+      "■ /root/e — interrupted",
+    ],
+  );
+});
+
+test("wait rendering identifies the mailbox and active agents", async () => {
+  const team = {
+    waitSummary: () => ({
+      waiting_agent: "/root",
+      waited_on: ["/root/researcher", "/root/coder"],
+      timeout_ms: 30_000,
+    }),
+    wait: async () => ({ message: "Wait timed out.", timed_out: true }),
+  } as unknown as TeamManager;
+  const wait = createCollaborationTools(team, "/root").find((tool) => tool.name === "wait_agent")!;
+  const details = {
+    message: "Wait timed out.",
+    timed_out: true,
+    waiting_agent: "/root",
+    waited_on: ["/root/researcher", "/root/coder"],
+    timeout_ms: 30_000,
+  };
+
+  assert.equal(wait.renderShell, undefined);
+  assert.deepEqual(render(wait.renderCall!({}, theme, context())), [
+    "wait_agent /root/researcher, /root/coder (30s)",
+  ]);
+  assert.deepEqual(
+    render(wait.renderResult!({ content: [], details }, { expanded: false, isPartial: false }, theme, context())),
+    ["", "Timed out after 30s"],
+  );
+  assert.deepEqual(
+    render(wait.renderResult!({ content: [], details }, { expanded: true, isPartial: false }, theme, context())),
+    [
+      "",
+      "Timed out after 30s",
+      "Waiting agent: /root",
+      "Waited on: /root/researcher, /root/coder",
+      "Wait timed out.",
+    ],
   );
   assert.deepEqual(
     render(wait.renderResult!({ content: [], details: undefined }, { expanded: false, isPartial: false }, theme, context(true))),
-    ["", "• Wait failed"],
+    ["", "Wait failed"],
   );
+
+  const executed = await wait.execute("wait", {}, undefined as any, undefined as any, {} as any);
+  assert.deepEqual(executed.details, details);
 });

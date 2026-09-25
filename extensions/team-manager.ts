@@ -43,7 +43,15 @@ const SELF_PATH = safeRealpath(fileURLToPath(new URL("./index.ts", import.meta.u
 /** Maximum number of child turns allowed to run concurrently. */
 const MAX_CHILD_RUNS = positiveInteger(process.env.PI_MULTIAGENTS_MAX_CONCURRENCY, 8);
 /** Pi custom-message type used for agent mail. */
-const MAIL_TYPE = "pi-multiagents-v2-message";
+export const MAIL_TYPE = "pi-multiagents-v2-message";
+
+/** Structured rendering metadata attached to inter-agent mail. */
+export interface MailDetails {
+  source: string;
+  target: string;
+  type: "MESSAGE" | "FINAL_ANSWER";
+  payload: string;
+}
 /** Stable key for the persistent multi-agent UI surface. */
 const UI_KEY = "pi-multiagents-v2";
 /** Maximum widget lines; Pi may truncate longer widgets. */
@@ -446,15 +454,16 @@ export class TeamManager {
     const recipient = this.requireNode(target);
     const envelope = formatEnvelope(type, target, source, payload);
     this.signalActivity(target, "mailbox");
+    const details: MailDetails = { source, target, type, payload };
     if (target === ROOT) {
       this.pi.sendMessage(
-        { customType: MAIL_TYPE, content: envelope, display: false, details: { source, target, type } },
+        { customType: MAIL_TYPE, content: envelope, display: true, details },
         { triggerTurn, deliverAs: "steer" },
       );
       return;
     }
     await recipient.session!.sendCustomMessage(
-      { customType: MAIL_TYPE, content: envelope, display: false, details: { source, target, type } },
+      { customType: MAIL_TYPE, content: envelope, display: true, details },
       { triggerTurn, deliverAs: recipient.running ? "steer" : "nextTurn" },
     );
   }
@@ -485,6 +494,23 @@ export class TeamManager {
     return { target: node.path, previous_status: previousStatus };
   }
 
+  /** Describes the mailbox and active descendants a wait is observing. */
+  waitSummary(source: string, timeoutMs?: number) {
+    this.requireNode(source);
+    const waitedOn = [...this.nodes.values()]
+      .filter(
+        (node) =>
+          node.path.startsWith(`${source}/`) && (node.status === "running" || node.status === "pending_init"),
+      )
+      .map((node) => node.path)
+      .sort();
+    return {
+      waiting_agent: source,
+      waited_on: waitedOn,
+      timeout_ms: Math.min(Math.max(timeoutMs ?? 30_000, 100), 3_600_000),
+    };
+  }
+
   /** Waits for mailbox activity, steering input, or timeout. */
   async wait(source: string, timeoutMs: number | undefined, signal: AbortSignal | undefined) {
     const node = this.requireNode(source);
@@ -493,7 +519,7 @@ export class TeamManager {
       return { message: node.lastActivity === "steered" ? "Wait interrupted by new input." : "Wait completed.", timed_out: false };
     }
 
-    const timeout = Math.min(Math.max(timeoutMs ?? 30_000, 100), 3_600_000);
+    const timeout = this.waitSummary(source, timeoutMs).timeout_ms;
     const activity = await new Promise<"mailbox" | "steered" | "timeout">((resolve, reject) => {
       let timer: NodeJS.Timeout;
       const finish = (value: "mailbox" | "steered" | "timeout") => {
