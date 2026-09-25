@@ -44,6 +44,8 @@ const SELF_PATH = safeRealpath(fileURLToPath(new URL("./index.ts", import.meta.u
 const MAX_CHILD_RUNS = positiveInteger(process.env.PI_MULTIAGENTS_MAX_CONCURRENCY, 8);
 /** Pi custom-message type used for agent mail. */
 export const MAIL_TYPE = "pi-multiagents-v2-message";
+/** Pi custom-entry type linking a parent session to a restorable child session. */
+const CHILD_ENTRY_TYPE = "pi-multiagents-v2-child";
 
 /** Structured rendering metadata attached to inter-agent mail. */
 export interface MailDetails {
@@ -89,6 +91,9 @@ interface AgentNode {
   path: string;
   parent: string | null;
   session?: AgentSession;
+  loadingSession?: Promise<AgentSession>;
+  sessionManager?: SessionManager;
+  registration?: ChildRegistration;
   status: AgentStatus;
   color: AgentColor;
   pendingTasks: string[];
@@ -133,6 +138,16 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | null {
 interface ParentContextReference {
   sessionId: string;
   messageId: string | null;
+}
+
+interface ChildRegistration {
+  version: 1;
+  path: string;
+  parent: string;
+  sessionId: string;
+  agentType?: string;
+  activeTools: string[];
+  parentContext?: ParentContextReference;
 }
 
 /** Returns the parent session entry immediately before the assistant turn containing a spawn call. */
@@ -217,6 +232,7 @@ export class TeamManager {
     }
     const root = this.requireNode(ROOT);
     root.status = { completed: null };
+    if (ctx.sessionManager) this.restoreChildren(ROOT, ctx.sessionManager);
     this.refreshUi();
   }
 
@@ -282,6 +298,55 @@ export class TeamManager {
     return (this.modelRuntimePromise ??= ModelRuntime.create());
   }
 
+  /** Restores persisted child registrations from the active branch of a parent session. */
+  private restoreChildren(
+    parent: string,
+    parentSessionManager: Pick<SessionManager, "getBranch" | "getSessionDir">,
+  ): void {
+    for (const entry of parentSessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== CHILD_ENTRY_TYPE) continue;
+      const registration = this.parseChildRegistration(entry.data);
+      if (!registration || registration.parent !== parent || this.nodes.has(registration.path)) continue;
+      const sessionFile = SessionManager.findById(this.cwd, registration.sessionId, parentSessionManager.getSessionDir());
+      if (!sessionFile) continue;
+
+      const sessionManager = SessionManager.open(sessionFile, parentSessionManager.getSessionDir(), this.cwd);
+      const node = this.newNode(registration.path, parent);
+      node.sessionManager = sessionManager;
+      node.registration = registration;
+      node.status = { completed: lastAssistantText(sessionManager.buildSessionContext().messages) };
+      this.nodes.set(node.path, node);
+      this.restoreChildren(node.path, sessionManager);
+    }
+  }
+
+  /** Validates a persisted child registration without trusting arbitrary custom-entry data. */
+  private parseChildRegistration(value: unknown): ChildRegistration | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const item = value as Partial<ChildRegistration>;
+    const parentContext = item.parentContext;
+    const validParentContext =
+      parentContext === undefined ||
+      (typeof parentContext === "object" &&
+        parentContext !== null &&
+        typeof parentContext.sessionId === "string" &&
+        (typeof parentContext.messageId === "string" || parentContext.messageId === null));
+    if (
+      item.version !== 1 ||
+      typeof item.path !== "string" ||
+      typeof item.parent !== "string" ||
+      !item.path.startsWith(`${item.parent}/`) ||
+      typeof item.sessionId !== "string" ||
+      (item.agentType !== undefined && typeof item.agentType !== "string") ||
+      !Array.isArray(item.activeTools) ||
+      !item.activeTools.every((tool) => typeof tool === "string") ||
+      !validParentContext
+    ) {
+      return undefined;
+    }
+    return item as ChildRegistration;
+  }
+
   /** Reads the source agent messages available for context forking. */
   private sourceMessages(source: string, ctx: ExtensionContext): AgentMessage[] {
     if (source !== ROOT) return [...this.requireNode(source).session!.messages];
@@ -303,6 +368,76 @@ export class TeamManager {
     return (source === ROOT ? ctx.thinkingLevel : this.requireNode(source).session!.thinkingLevel) ?? "off";
   }
 
+  /** Creates an executable AgentSession around a new or restored child session manager. */
+  private async createManagedSession(
+    registration: ChildRegistration,
+    sessionManager: SessionManager,
+    model?: Model<any>,
+    thinkingLevel?: ThinkingLevel,
+  ): Promise<AgentSession> {
+    const settingsManager = SettingsManager.create(this.cwd, getAgentDir());
+    const loader = new DefaultResourceLoader({
+      cwd: this.cwd,
+      agentDir: getAgentDir(),
+      settingsManager,
+      extensionsOverride: (base) => ({
+        ...base,
+        extensions: base.extensions.filter((extension) => {
+          const isThisExtension =
+            safeRealpath(extension.resolvedPath) === SELF_PATH ||
+            (extension.tools.has("spawn_agent") && extension.tools.has("followup_task"));
+          const isUntrustedProjectExtension = extension.sourceInfo.scope === "project" && !this.projectTrusted;
+          return !isThisExtension && !isUntrustedProjectExtension;
+        }),
+      }),
+      appendSystemPromptOverride: (base) => [
+        ...base,
+        subagentInstructions(
+          registration.path,
+          registration.parent,
+          registration.agentType,
+          registration.parentContext,
+        ),
+      ],
+    });
+    await loader.reload();
+
+    const { session } = await createAgentSession({
+      cwd: this.cwd,
+      agentDir: getAgentDir(),
+      modelRuntime: await this.modelRuntime(),
+      model,
+      thinkingLevel,
+      tools: registration.activeTools,
+      customTools: this.createTools(registration.path),
+      resourceLoader: loader,
+      sessionManager,
+      settingsManager,
+    });
+    try {
+      await session.bindExtensions({ mode: "print" });
+      return session;
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
+  }
+
+  /** Lazily recreates a restored child's executable session. */
+  private async ensureSession(node: AgentNode): Promise<AgentSession> {
+    if (this.disposed) throw new Error("Agent team is shutting down");
+    if (node.session) return node.session;
+    if (node.loadingSession) return node.loadingSession;
+    if (!node.sessionManager || !node.registration) throw new Error(`Agent session cannot be restored: ${node.path}`);
+    node.loadingSession = this.createManagedSession(node.registration, node.sessionManager);
+    try {
+      node.session = await node.loadingSession;
+      return node.session;
+    } finally {
+      node.loadingSession = undefined;
+    }
+  }
+
   /** Creates and schedules a child agent session. */
   async spawn(source: string, params: SpawnParams, ctx: ExtensionContext, toolCallId: string) {
     if (this.disposed) throw new Error("Agent team is shutting down");
@@ -322,7 +457,6 @@ export class TeamManager {
 
     this.reservedPaths.add(path);
     try {
-      const runtime = await this.modelRuntime();
       const inheritedModel = this.sourceModel(source, ctx);
       let model = inheritedModel;
       if (params.model) {
@@ -340,52 +474,36 @@ export class TeamManager {
         sessionManager.appendMessage(message as Parameters<SessionManager["appendMessage"]>[0]);
       }
 
-      const settingsManager = SettingsManager.create(this.cwd, getAgentDir());
-      const loader = new DefaultResourceLoader({
-        cwd: this.cwd,
-        agentDir: getAgentDir(),
-        settingsManager,
-        extensionsOverride: (base) => ({
-          ...base,
-          extensions: base.extensions.filter((extension) => {
-            const isThisExtension =
-              safeRealpath(extension.resolvedPath) === SELF_PATH ||
-              (extension.tools.has("spawn_agent") && extension.tools.has("followup_task"));
-            const isUntrustedProjectExtension = extension.sourceInfo.scope === "project" && !this.projectTrusted;
-            return !isThisExtension && !isUntrustedProjectExtension;
-          }),
-        }),
-        appendSystemPromptOverride: (base) => [
-          ...base,
-          subagentInstructions(path, source, params.agent_type?.trim() || undefined, parentContext),
-        ],
-      });
-      await loader.reload();
-
-      const activeTools = [...new Set([...this.sourceTools(source), ...COLLABORATION_TOOLS])];
-      const { session } = await createAgentSession({
-        cwd: this.cwd,
-        agentDir: getAgentDir(),
-        modelRuntime: runtime,
-        model,
-        thinkingLevel: params.reasoning_effort ?? this.sourceThinking(source, ctx),
-        tools: activeTools,
-        customTools: this.createTools(path),
-        resourceLoader: loader,
+      const registration: ChildRegistration = {
+        version: 1,
+        path,
+        parent: source,
+        sessionId: sessionManager.getSessionId(),
+        agentType: params.agent_type?.trim() || undefined,
+        activeTools: [...new Set([...this.sourceTools(source), ...COLLABORATION_TOOLS])],
+        parentContext,
+      };
+      const session = await this.createManagedSession(
+        registration,
         sessionManager,
-        settingsManager,
-      });
+        model,
+        params.reasoning_effort ?? this.sourceThinking(source, ctx),
+      );
 
       const node = this.newNode(path, source);
       node.session = session;
-      this.nodes.set(path, node);
+      node.sessionManager = sessionManager;
+      node.registration = registration;
       try {
-        await session.bindExtensions({ mode: "print" });
+        if (sessionManager.isPersisted()) {
+          if (source === ROOT) this.pi.appendEntry(CHILD_ENTRY_TYPE, registration);
+          else this.requireNode(source).session!.sessionManager.appendCustomEntry(CHILD_ENTRY_TYPE, registration);
+        }
       } catch (error) {
-        this.nodes.delete(path);
         session.dispose();
         throw error;
       }
+      this.nodes.set(path, node);
 
       this.enqueue(node, formatEnvelope("NEW_TASK", path, source, params.message));
       return { task_name: path, status: node.status };
@@ -469,10 +587,11 @@ export class TeamManager {
   async followup(source: string, target: string, message: string) {
     const recipient = this.resolve(source, target);
     if (recipient.path === ROOT) throw new Error("followup_task cannot target /root");
+    const session = await this.ensureSession(recipient);
     const envelope = formatEnvelope("NEW_TASK", recipient.path, source, message);
     this.signalActivity(recipient.path, "mailbox");
     if (recipient.running) {
-      await recipient.session!.sendCustomMessage(
+      await session.sendCustomMessage(
         { customType: MAIL_TYPE, content: envelope, display: false, details: { source, target: recipient.path } },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -502,7 +621,8 @@ export class TeamManager {
       );
       return;
     }
-    await recipient.session!.sendCustomMessage(
+    const session = await this.ensureSession(recipient);
+    await session.sendCustomMessage(
       { customType: MAIL_TYPE, content: envelope, display: true, details },
       { triggerTurn, deliverAs: recipient.running ? "steer" : "nextTurn" },
     );
@@ -527,8 +647,8 @@ export class TeamManager {
     const previousStatus = node.status;
     node.interrupted = true;
     node.pendingTasks.length = 0;
-    node.session!.clearQueue();
-    if (node.running) await node.session!.abort();
+    node.session?.clearQueue();
+    if (node.running) await node.session?.abort();
     node.status = "interrupted";
     this.refreshUi(true);
     return { target: node.path, previous_status: previousStatus };
@@ -743,18 +863,18 @@ export class TeamManager {
     if (this.disposed) return;
     this.disposed = true;
     this.runQueue.length = 0;
-    const children = [...this.nodes.values()].filter((node) => node.session);
+    const children = [...this.nodes.values()].filter((node) => node.session || node.loadingSession);
     for (const node of children) {
       node.interrupted = true;
       node.pendingTasks.length = 0;
     }
     await Promise.all(
-      children.map((node) =>
-        node.session!
-          .abort()
-          .catch(() => undefined)
-          .finally(() => node.session!.dispose()),
-      ),
+      children.map(async (node) => {
+        const session = node.session ?? (await node.loadingSession?.catch(() => undefined));
+        if (!session) return;
+        await session.abort().catch(() => undefined);
+        session.dispose();
+      }),
     );
     for (const node of children) node.status = "shutdown";
     this.cancelPanelPopup();

@@ -24,7 +24,7 @@ pi -e git:github.com/YoungseokCh/pi-multiagents-v2
 - Recursive subagent spawning
 - Independent context windows with `fork_turns: "none" | "all" | "N"`
 - Asynchronous agent mailboxes and automatic final-answer delivery
-- Persistent child context for follow-up tasks
+- Persistent child context and agent identity across reloads for follow-up tasks
 - Configurable child-run concurrency (`PI_MULTIAGENTS_MAX_CONCURRENCY`, default `8`)
 
 ## Tools

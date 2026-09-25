@@ -78,7 +78,7 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
       "Spawn an agent for a concrete, bounded subtask. The child gets a canonical path, independent context, shared filesystem, the same active tools, and recursive delegation tools.",
     promptSnippet: "Spawn a child agent for independent parallel work",
     promptGuidelines: [
-      "Do not spawn sub-agents unless the user or applicable AGENTS.md or skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
+      "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
       "Before delegating, quickly plan the overall task: identify critical-path blockers, independent sidecar work, and the immediate task you should do locally. Keep urgent, tightly coupled, difficult, or immediately blocking work local.",
       "Delegate only concrete, bounded, well-defined, self-contained subtasks that materially advance the main task and can run in parallel with useful local work. Do not duplicate delegated work or issue multiple calls for the same unresolved task unless the new task is genuinely different and necessary.",
       "For coding work, prefer a bounded implementation task over read-only exploration when the child can safely make the change. Give agents disjoint write scopes, tell them to edit files directly, and ask them to list changed paths in their final answer.",
