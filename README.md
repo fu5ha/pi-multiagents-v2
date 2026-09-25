@@ -25,6 +25,7 @@ pi -e git:github.com/YoungseokCh/pi-multiagents-v2
 - Independent context windows with `fork_turns: "none" | "all" | "N"`
 - Asynchronous agent mailboxes and automatic final-answer delivery
 - Persistent child context and agent identity across reloads for follow-up tasks
+- Paused-turn detection with `/multiagents-resume all|<agent-path>` recovery
 - Configurable child-run concurrency (`PI_MULTIAGENTS_MAX_CONCURRENCY`, default `8`)
 
 ## Tools

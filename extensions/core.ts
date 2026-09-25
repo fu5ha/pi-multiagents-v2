@@ -4,6 +4,7 @@
 export type AgentStatus =
   | "pending_init"
   | "running"
+  | "paused"
   | "interrupted"
   | "shutdown"
   | "not_found"

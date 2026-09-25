@@ -73,6 +73,19 @@ export default function subagentsV2(pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify(`Multi-agent panel ${pinned ? "pinned" : "hidden between updates"}`, "info");
     },
   });
+  pi.registerCommand("multiagents-resume", {
+    description: "Resume all paused sub-agents, or one agent by path",
+    async handler(args, ctx) {
+      const target = args.trim() || "all";
+      const result = await team.resumePaused(target);
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          result.resumed.length > 0 ? `Resumed ${result.resumed.join(", ")}` : `No paused agents matched ${target}`,
+          "info",
+        );
+      }
+    },
+  });
 
   pi.on("session_start", (_event, ctx) => team.start(ctx));
   pi.on("before_agent_start", (event) => ({

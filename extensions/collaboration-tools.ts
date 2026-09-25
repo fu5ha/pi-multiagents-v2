@@ -26,6 +26,7 @@ const COLLAPSED_AGENT_LIMIT = 3;
 function describeAgentStatus(status: AgentStatus): { icon: string; label: string; detail?: string } {
   if (status === "running") return { icon: "⏳", label: "running" };
   if (status === "pending_init") return { icon: "…", label: "pending" };
+  if (status === "paused") return { icon: "⏸", label: "paused" };
   if (status === "interrupted") return { icon: "■", label: "interrupted" };
   if (status === "shutdown") return { icon: "■", label: "shutdown" };
   if (status === "not_found") return { icon: "?", label: "not found" };

@@ -46,6 +46,8 @@ const MAX_CHILD_RUNS = positiveInteger(process.env.PI_MULTIAGENTS_MAX_CONCURRENC
 export const MAIL_TYPE = "pi-multiagents-v2-message";
 /** Pi custom-entry type linking a parent session to a restorable child session. */
 const CHILD_ENTRY_TYPE = "pi-multiagents-v2-child";
+/** Pi custom-entry type recording whether a child turn reached a terminal state. */
+const RUN_STATE_ENTRY_TYPE = "pi-multiagents-v2-run-state";
 
 /** Structured rendering metadata attached to inter-agent mail. */
 export interface MailDetails {
@@ -94,6 +96,7 @@ interface AgentNode {
   loadingSession?: Promise<AgentSession>;
   sessionManager?: SessionManager;
   registration?: ChildRegistration;
+  pausedTask?: string;
   status: AgentStatus;
   color: AgentColor;
   pendingTasks: string[];
@@ -148,6 +151,13 @@ interface ChildRegistration {
   agentType?: string;
   activeTools: string[];
   parentContext?: ParentContextReference;
+}
+
+interface RunStateEntry {
+  version: 1;
+  path: string;
+  state: "running" | "completed" | "errored" | "interrupted";
+  task?: string;
 }
 
 /** Returns the parent session entry immediately before the assistant turn containing a spawn call. */
@@ -233,6 +243,7 @@ export class TeamManager {
     const root = this.requireNode(ROOT);
     root.status = { completed: null };
     if (ctx.sessionManager) this.restoreChildren(ROOT, ctx.sessionManager);
+    this.notifyPausedAgents();
     this.refreshUi();
   }
 
@@ -314,10 +325,57 @@ export class TeamManager {
       const node = this.newNode(registration.path, parent);
       node.sessionManager = sessionManager;
       node.registration = registration;
-      node.status = { completed: lastAssistantText(sessionManager.buildSessionContext().messages) };
+      const runState = this.latestRunState(sessionManager, node.path);
+      if (runState?.state === "running") {
+        node.status = "paused";
+        node.pausedTask = runState.task;
+      } else {
+        node.status = { completed: lastAssistantText(sessionManager.buildSessionContext().messages) };
+      }
       this.nodes.set(node.path, node);
       this.restoreChildren(node.path, sessionManager);
     }
+  }
+
+  /** Returns the latest valid persisted run state for an agent. */
+  private latestRunState(
+    sessionManager: Pick<SessionManager, "getBranch">,
+    path: string,
+  ): RunStateEntry | undefined {
+    for (const entry of sessionManager.getBranch().toReversed()) {
+      if (entry.type !== "custom" || entry.customType !== RUN_STATE_ENTRY_TYPE) continue;
+      const value = entry.data;
+      if (!value || typeof value !== "object") continue;
+      const state = value as Partial<RunStateEntry>;
+      if (
+        state.version === 1 &&
+        state.path === path &&
+        (state.state === "running" ||
+          state.state === "completed" ||
+          state.state === "errored" ||
+          state.state === "interrupted") &&
+        (state.task === undefined || typeof state.task === "string")
+      ) {
+        return state as RunStateEntry;
+      }
+    }
+    return undefined;
+  }
+
+  /** Posts one model- and user-visible notice when reload restored paused agents. */
+  private notifyPausedAgents(): void {
+    const paused = [...this.nodes.values()].filter((node) => node.status === "paused").map((node) => node.path);
+    if (paused.length === 0) return;
+    const payload = `Reload paused ${paused.length} sub-agent session${paused.length === 1 ? "" : "s"}: ${paused.join(", ")}. Use /multiagents-resume all or /multiagents-resume <agent-path> to resume them; followup_task also resumes a paused agent.`;
+    this.pi.sendMessage(
+      {
+        customType: MAIL_TYPE,
+        content: formatEnvelope("MESSAGE", ROOT, "multiagents", payload),
+        display: true,
+        details: { source: "multiagents", target: ROOT, type: "MESSAGE", payload } satisfies MailDetails,
+      },
+      { triggerTurn: false, deliverAs: "steer" },
+    );
   }
 
   /** Validates a persisted child registration without trusting arbitrary custom-entry data. */
@@ -512,6 +570,37 @@ export class TeamManager {
     }
   }
 
+  /** Persists the lifecycle state needed to detect an unfinished turn after reload. */
+  private recordRunState(node: AgentNode, state: RunStateEntry["state"], task?: string): void {
+    node.sessionManager?.appendCustomEntry(RUN_STATE_ENTRY_TYPE, {
+      version: 1,
+      path: node.path,
+      state,
+      task,
+    } satisfies RunStateEntry);
+  }
+
+  /** Resumes one paused agent or every paused agent after a reload. */
+  async resumePaused(target?: string) {
+    const nodes = target && target !== "all"
+      ? [this.resolve(ROOT, target)]
+      : [...this.nodes.values()].filter((node) => node.status === "paused");
+    const paused = nodes.filter((node) => node.path !== ROOT && node.status === "paused");
+    for (const node of paused) {
+      await this.ensureSession(node);
+      this.enqueue(
+        node,
+        formatEnvelope(
+          "NEW_TASK",
+          node.path,
+          ROOT,
+          "Resume the task interrupted by reload. Continue from the existing session context without repeating completed work.",
+        ),
+      );
+    }
+    return { resumed: paused.map((node) => node.path) };
+  }
+
   /** Queues a task and schedules its agent when idle. */
   private enqueue(node: AgentNode, task: string): void {
     node.pendingTasks.push(task);
@@ -541,6 +630,8 @@ export class TeamManager {
   private async runNode(node: AgentNode, task: string): Promise<void> {
     node.running = true;
     node.status = "running";
+    node.pausedTask = task;
+    this.recordRunState(node, "running", task);
     this.activeChildRuns++;
     this.refreshUi(true);
     try {
@@ -550,6 +641,8 @@ export class TeamManager {
       } else {
         const output = lastAssistantText(node.session!.messages);
         node.status = { completed: output };
+        node.pausedTask = undefined;
+        this.recordRunState(node, "completed");
         if (node.parent) {
           await this.deliver(node.path, node.parent, "FINAL_ANSWER", output ?? "(no output)", false).catch(() => undefined);
         }
@@ -557,9 +650,15 @@ export class TeamManager {
     } catch (error) {
       if (node.interrupted) {
         node.status = "interrupted";
+        if (!this.disposed) {
+          node.pausedTask = undefined;
+          this.recordRunState(node, "interrupted");
+        }
       } else {
         const message = error instanceof Error ? error.message : String(error);
         node.status = { errored: message };
+        node.pausedTask = undefined;
+        this.recordRunState(node, "errored");
         if (node.parent) {
           await this.deliver(node.path, node.parent, "FINAL_ANSWER", `Agent error: ${message}`, false).catch(() => undefined);
         }
@@ -649,6 +748,8 @@ export class TeamManager {
     node.pendingTasks.length = 0;
     node.session?.clearQueue();
     if (node.running) await node.session?.abort();
+    else this.recordRunState(node, "interrupted");
+    node.pausedTask = undefined;
     node.status = "interrupted";
     this.refreshUi(true);
     return { target: node.path, previous_status: previousStatus };
@@ -721,6 +822,7 @@ export class TeamManager {
   private describeStatus(status: AgentStatus): { icon: string; label: string; rank: number } {
     if (status === "running") return { icon: "⏳", label: "running", rank: 0 };
     if (status === "pending_init") return { icon: "…", label: "pending", rank: 1 };
+    if (status === "paused") return { icon: "⏸", label: "paused", rank: 2 };
     if (status === "interrupted") return { icon: "■", label: "interrupted", rank: 3 };
     if (status === "shutdown") return { icon: "", label: "shutdown", rank: 5 };
     if (status === "not_found") return { icon: "?", label: "not found", rank: 4 };
