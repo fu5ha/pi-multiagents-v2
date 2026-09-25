@@ -78,8 +78,14 @@ export function createCollaborationTools(team: TeamManager, source: string): Too
       "Spawn an agent for a concrete, bounded subtask. The child gets a canonical path, independent context, shared filesystem, the same active tools, and recursive delegation tools.",
     promptSnippet: "Spawn a child agent for independent parallel work",
     promptGuidelines: [
-      "Only spawn agents when there is a good reason to do so, not simply because you can.",
-      "When spawning an agent with a different model or reasoning effort, you cannot use `fork_turns: all`, you must use none or choose a number of turns."
+      "Do not spawn sub-agents unless the user or applicable AGENTS.md or skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.",
+      "Before delegating, quickly plan the overall task: identify critical-path blockers, independent sidecar work, and the immediate task you should do locally. Keep urgent, tightly coupled, difficult, or immediately blocking work local.",
+      "Delegate only concrete, bounded, well-defined, self-contained subtasks that materially advance the main task and can run in parallel with useful local work. Do not duplicate delegated work or issue multiple calls for the same unresolved task unless the new task is genuinely different and necessary.",
+      "For coding work, prefer a bounded implementation task over read-only exploration when the child can safely make the change. Give agents disjoint write scopes, tell them to edit files directly, and ask them to list changed paths in their final answer.",
+      "After delegating, immediately continue meaningful non-overlapping work if any exists. Do not redo the delegated task, use wait_agent only when its result blocks the next critical-path step, and review returned changes before integrating them.",
+      "Parallelize distinct independent questions or disjoint implementation slices, and delegate verification only when it can overlap implementation and is likely to catch a concrete risk.",
+      "Omitting `fork_turns` defaults to `all` and passes all surrounding context. Be careful of this when there is already a lot of context in the current thread. Use `none` and explicitly pass through links to needed context in these situations.",
+      "Full-history forks inherit the parent model and reasoning effort. To override either, you must set `fork_turns` to `none` or a positive integer string, not `all` or default.",
     ],
     parameters: Type.Object(
       {

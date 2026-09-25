@@ -51,6 +51,17 @@ test("Codex-style spawn rendering", () => {
   );
 });
 
+test("spawn guidance follows the bundled delegation policy", () => {
+  const spawn = createCollaborationTools({} as TeamManager, "/root").find((tool) => tool.name === "spawn_agent")!;
+  const guidance = spawn.promptGuidelines?.join("\n") ?? "";
+
+  assert.match(guidance, /Do not spawn sub-agents unless the user or applicable AGENTS\.md\/skill instructions explicitly ask/);
+  assert.match(guidance, /critical-path blockers/);
+  assert.match(guidance, /disjoint write scopes/);
+  assert.match(guidance, /use wait_agent only when its result blocks/);
+  assert.match(guidance, /Omitting `fork_turns` defaults to `all`/);
+});
+
 test("message, follow-up, and interrupt use standard Pi tool blocks", () => {
   const tools = createCollaborationTools({} as TeamManager, "/root");
   const cases = [
