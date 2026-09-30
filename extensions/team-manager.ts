@@ -7,7 +7,6 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
 import {
   type AgentSession,
-  createAgentSession,
   DefaultResourceLoader,
   type ExtensionAPI,
   type ExtensionContext,
@@ -26,6 +25,7 @@ import {
   selectForkMessages,
 } from "./core.ts";
 import { createCollaborationTools } from "./collaboration-tools.ts";
+import { childToolExtensions, createChildAgentSession, disposeChildAgentSession } from "./child-session.ts";
 
 /** Canonical path of the primary agent. */
 export const ROOT = "/root";
@@ -438,6 +438,7 @@ export class TeamManager {
       cwd: this.cwd,
       agentDir: getAgentDir(),
       settingsManager,
+      extensionFactories: childToolExtensions(),
       extensionsOverride: (base) => ({
         ...base,
         extensions: base.extensions.filter((extension) => {
@@ -460,25 +461,17 @@ export class TeamManager {
     });
     await loader.reload();
 
-    const { session } = await createAgentSession({
+    return createChildAgentSession({
       cwd: this.cwd,
       agentDir: getAgentDir(),
       modelRuntime: await this.modelRuntime(),
       model,
       thinkingLevel,
-      tools: registration.activeTools,
       customTools: this.createTools(registration.path),
       resourceLoader: loader,
       sessionManager,
       settingsManager,
-    });
-    try {
-      await session.bindExtensions({ mode: "print" });
-      return session;
-    } catch (error) {
-      session.dispose();
-      throw error;
-    }
+    }, registration.activeTools);
   }
 
   /** Lazily recreates a restored child's executable session. */
@@ -558,7 +551,7 @@ export class TeamManager {
           else this.requireNode(source).session!.sessionManager.appendCustomEntry(CHILD_ENTRY_TYPE, registration);
         }
       } catch (error) {
-        session.dispose();
+        await disposeChildAgentSession(session).catch(() => undefined);
         throw error;
       }
       this.nodes.set(path, node);
@@ -975,7 +968,7 @@ export class TeamManager {
         const session = node.session ?? (await node.loadingSession?.catch(() => undefined));
         if (!session) return;
         await session.abort().catch(() => undefined);
-        session.dispose();
+        await disposeChildAgentSession(session);
       }),
     );
     for (const node of children) node.status = "shutdown";
@@ -983,4 +976,3 @@ export class TeamManager {
     this.clearUi(true);
   }
 }
-

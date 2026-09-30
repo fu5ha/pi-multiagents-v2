@@ -27,6 +27,12 @@ pi -e git:github.com/YoungseokCh/pi-multiagents-v2
 - Persistent child context and agent identity across reloads for follow-up tasks
 - Paused-turn detection with `/multiagents-resume all|<agent-path>` recovery
 - Configurable child-run concurrency (`PI_MULTIAGENTS_MAX_CONCURRENCY`, default `8`)
+- Child sessions load Pi's built-in codemode, tool search, and MCP support, honoring extension
+  settings and replacements. They inherit active tools without restricting tools registered later
+  by MCP. Child MCP connections close when the team shuts down.
+
+Requires Pi 0.99.2 or newer. After updating this extension, run `/reload` before resuming paused
+children so their tool runtimes are recreated.
 
 ## Tools
 
