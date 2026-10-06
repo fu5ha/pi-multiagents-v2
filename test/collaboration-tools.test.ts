@@ -58,7 +58,7 @@ test("spawn guidance follows the bundled delegation policy", () => {
   assert.match(guidance, /Do not spawn sub-agents unless the user or applicable AGENTS\.md\/skill instructions explicitly ask/);
   assert.match(guidance, /critical-path blockers/);
   assert.match(guidance, /disjoint write scopes/);
-  assert.match(guidance, /use wait_agent only when its result blocks/);
+  assert.match(guidance, /end your turn with a brief status update and wait passively/);
   assert.match(guidance, /Omitting `fork_turns` defaults to `all`/);
 });
 

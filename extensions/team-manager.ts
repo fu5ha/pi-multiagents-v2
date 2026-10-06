@@ -888,7 +888,7 @@ export class TeamManager {
     if (target === ROOT) {
       this.pi.sendMessage(
         { customType: MAIL_TYPE, content: envelope, display: true, details },
-        { triggerTurn, deliverAs: "steer" },
+        { triggerTurn: triggerTurn || type === "FINAL_ANSWER", deliverAs: "steer" },
       );
       return;
     }
