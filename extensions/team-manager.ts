@@ -1,6 +1,7 @@
 /** Agent session lifecycle, scheduling, persistence, and mailbox coordination. */
 
-import { realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -48,6 +49,8 @@ export const MAIL_TYPE = "pi-multiagents-v2-message";
 const CHILD_ENTRY_TYPE = "pi-multiagents-v2-child";
 /** Pi custom-entry type recording whether a child turn reached a terminal state. */
 const RUN_STATE_ENTRY_TYPE = "pi-multiagents-v2-run-state";
+/** Acknowledgment is separate from execution completion: queue admission is not delivery. */
+const REPORT_ACK_ENTRY_TYPE = "pi-multiagents-v2-report-ack";
 
 /** Structured rendering metadata attached to inter-agent mail. */
 export interface MailDetails {
@@ -55,6 +58,7 @@ export interface MailDetails {
   target: string;
   type: "MESSAGE" | "FINAL_ANSWER";
   payload: string;
+  reportId?: string;
 }
 /** Stable key for the persistent multi-agent UI surface. */
 const UI_KEY = "pi-multiagents-v2";
@@ -158,6 +162,23 @@ interface RunStateEntry {
   path: string;
   state: "running" | "completed" | "errored" | "interrupted";
   task?: string;
+  report?: CompletionReport;
+}
+
+interface CompletionReport {
+  id: string;
+  source: string;
+  target: string;
+  payload: string;
+}
+
+interface PendingReport {
+  node: AgentNode;
+  report: CompletionReport;
+  state: "completed" | "errored";
+  persisted: boolean;
+  task?: string;
+  restored?: boolean;
 }
 
 /** Returns the parent session entry immediately before the assistant turn containing a spawn call. */
@@ -222,6 +243,11 @@ export class TeamManager {
   private tuiWidgetRegistered = false;
   private nextColorIndex = 0;
   private readonly pi: ExtensionAPI;
+  private rootContext?: ExtensionContext;
+  private readonly pendingReports = new Map<string, PendingReport>();
+  private readonly reportsInFlight = new Set<string>();
+  private reportRetryTimer?: NodeJS.Timeout;
+  private reportReconciliation?: Promise<void>;
 
   /** Creates a team rooted at `/root`. */
   constructor(pi: ExtensionAPI) {
@@ -231,6 +257,7 @@ export class TeamManager {
 
   /** Initializes root state for the active Pi session. */
   start(ctx: ExtensionContext): void {
+    this.rootContext = ctx;
     this.cwd = ctx.cwd;
     this.projectTrusted = ctx.isProjectTrusted();
     this.ui = ctx.hasUI ? ctx.ui : undefined;
@@ -243,6 +270,11 @@ export class TeamManager {
     const root = this.requireNode(ROOT);
     root.status = { completed: null };
     if (ctx.sessionManager) this.restoreChildren(ROOT, ctx.sessionManager);
+    // SDK steering/nextTurn queues are volatile. Only an appended recipient message
+    // acknowledges a report; queued reports remain pending across reload.
+    this.reportRetryTimer ??= setInterval(() => void this.retryCompletionReports(), 1_000);
+    this.reportRetryTimer.unref();
+    void this.retryCompletionReports();
     this.notifyPausedAgents();
     this.refreshUi();
   }
@@ -333,6 +365,7 @@ export class TeamManager {
         node.status = { completed: lastAssistantText(sessionManager.buildSessionContext().messages) };
       }
       this.nodes.set(node.path, node);
+      this.restoreReports(node);
       this.restoreChildren(node.path, sessionManager);
     }
   }
@@ -573,6 +606,160 @@ export class TeamManager {
     } satisfies RunStateEntry);
   }
 
+  /** One JSONL entry records terminal execution and its complete notification intent. */
+  private async recordCompletion(
+    node: AgentNode,
+    state: "completed" | "errored",
+    payload: string,
+  ): Promise<void> {
+    if (!node.parent) {
+      this.recordRunState(node, state);
+      return;
+    }
+    const report: CompletionReport = { id: randomUUID(), source: node.path, target: node.parent, payload };
+    this.pendingReports.set(report.id, {
+      node, report, state, persisted: false, task: node.pausedTask,
+    });
+    node.pausedTask = undefined;
+    await this.retryCompletionReports();
+  }
+
+  private persistCompletion(pending: PendingReport): void {
+    const { node, state, report, task } = pending;
+    const manager = node.sessionManager!;
+    // Pi buffers setup-only sessions until their first user/assistant message.
+    // A prompt can fail before admission; retain that failed assignment so this
+    // error report is not merely an in-memory custom entry.
+    if (!manager.getEntries().some((entry) =>
+      entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"))) {
+      manager.appendMessage({ role: "user", content: task ?? "(failed child task)", timestamp: Date.now() });
+    }
+    manager.appendCustomEntry(RUN_STATE_ENTRY_TYPE, {
+      version: 1, path: node.path, state, report,
+    } satisfies RunStateEntry);
+    pending.persisted = true;
+  }
+
+  /** Restores every unacknowledged report, including reports from earlier follow-up runs. */
+  private restoreReports(node: AgentNode): void {
+    const acknowledged = new Set<string>();
+    for (const entry of node.sessionManager!.getBranch()) {
+      if (entry.type !== "custom") continue;
+      const value = entry.data as Partial<RunStateEntry & { reportId: string }> | undefined;
+      if (!value || value.version !== 1) continue;
+      if (entry.customType === REPORT_ACK_ENTRY_TYPE && typeof value.reportId === "string") {
+        acknowledged.add(value.reportId);
+      } else if (entry.customType === RUN_STATE_ENTRY_TYPE && value.path === node.path &&
+        (value.state === "completed" || value.state === "errored")) {
+        const report = value.report;
+        if (report && typeof report.id === "string" && report.source === node.path &&
+          report.target === node.parent && typeof report.payload === "string") {
+          this.pendingReports.set(report.id, { node, report, state: value.state, persisted: true, restored: true });
+        }
+      }
+    }
+    for (const id of acknowledged) this.pendingReports.delete(id);
+  }
+
+  /** Uses the actual mail entry as the receipt, not a separate pre-delivery marker. */
+  private reportReceived(report: CompletionReport): boolean {
+    const manager = report.target === ROOT
+      ? this.rootContext?.sessionManager
+      : this.nodes.get(report.target)?.sessionManager;
+    if (!manager) return false;
+    const entry = manager.getBranch().find((entry) =>
+      entry.type === "custom_message" && entry.customType === MAIL_TYPE &&
+      (entry.details as Partial<MailDetails> | undefined)?.reportId === report.id &&
+      (entry.details as Partial<MailDetails> | undefined)?.source === report.source &&
+      (entry.details as Partial<MailDetails> | undefined)?.target === report.target);
+    if (!entry) return false;
+    const file = manager.getSessionFile();
+    if (!file) return true; // Ephemeral teams intentionally have no crash durability.
+    // SessionManager updates its tree before its synchronous write. Verify disk
+    // before acknowledging, so a failed append cannot be mistaken for delivery.
+    return readFileSync(file, "utf8").split("\n").some((line) => {
+      try { return JSON.parse(line).id === entry.id; } catch { return false; }
+    });
+  }
+
+  /** Retries pending delivery without duplicating volatile SDK queue entries. */
+  retryCompletionReports(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.reportReconciliation) return this.reportReconciliation;
+    const reconciliation = this.reconcileReports();
+    this.reportReconciliation = reconciliation;
+    void reconciliation.finally(() => {
+      if (this.reportReconciliation === reconciliation) this.reportReconciliation = undefined;
+    });
+    return reconciliation;
+  }
+
+  private async reconcileReports(): Promise<void> {
+    for (const pending of this.pendingReports.values()) {
+      const { node, report } = pending;
+      if (this.disposed) return;
+      try {
+        // Failed writes remain observable and retryable in this process. Never
+        // send a report until its terminal intent has successfully been stored.
+        if (!pending.persisted) this.persistCompletion(pending);
+        if (this.reportReceived(report)) {
+          node.sessionManager!.appendCustomEntry(REPORT_ACK_ENTRY_TYPE, { version: 1, reportId: report.id });
+          this.pendingReports.delete(report.id);
+          this.reportsInFlight.delete(report.id);
+          continue;
+        }
+        // The root AgentSession survives an extension-only /reload. Its old
+        // steering queue may still contain this report; wait for it to settle
+        // before replaying restored root mail. Child runtimes are recreated.
+        if (pending.restored && report.target === ROOT &&
+          (!this.rootContext?.isIdle() || this.rootContext.hasPendingMessages())) continue;
+        if (this.reportsInFlight.has(report.id)) {
+          // ExtensionAPI.sendMessage is fire-and-forget and hides asynchronous
+          // errors. While busy it may still be queued; once idle an unappended
+          // root report can safely be retried. Child nextTurn queues intentionally
+          // wait for their next task, so keep those reservations until reload.
+          if (report.target !== ROOT || !this.rootContext?.isIdle() ||
+            this.rootContext.hasPendingMessages()) continue;
+          this.reportsInFlight.delete(report.id);
+        }
+        const details: MailDetails = {
+          source: report.source, target: report.target, type: "FINAL_ANSWER",
+          payload: report.payload, reportId: report.id,
+        };
+        const message = {
+          customType: MAIL_TYPE, content: formatEnvelope("FINAL_ANSWER", report.target, report.source, report.payload),
+          display: true, details,
+        };
+        this.reportsInFlight.add(report.id);
+        pending.restored = false;
+        if (report.target === ROOT) {
+          // The API does not return the underlying run promise. Its return is
+          // neither a receipt nor an acknowledgment; reconcile the transcript.
+          this.pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+        } else {
+          const recipient = this.requireNode(report.target);
+          const session = await this.ensureSession(recipient);
+          if (this.disposed) return;
+          await session.sendCustomMessage(message, {
+            triggerTurn: false, deliverAs: recipient.running ? "steer" : "nextTurn",
+          });
+        }
+        this.signalActivity(report.target, "mailbox");
+      } catch (error) {
+        this.reportsInFlight.delete(report.id);
+        this.reportDeliveryError(error);
+      }
+    }
+  }
+
+  private reportDeliveryError(error: unknown): void {
+    try {
+      this.ui?.notify(`Sub-agent notification remains pending: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    } catch {
+      // Notification rendering must not interrupt outbox reconciliation.
+    }
+  }
+
   /** Resumes one paused agent or every paused agent after a reload. */
   async resumePaused(target?: string) {
     const nodes = target && target !== "all"
@@ -634,11 +821,7 @@ export class TeamManager {
       } else {
         const output = lastAssistantText(node.session!.messages);
         node.status = { completed: output };
-        node.pausedTask = undefined;
-        this.recordRunState(node, "completed");
-        if (node.parent) {
-          await this.deliver(node.path, node.parent, "FINAL_ANSWER", output ?? "(no output)", false).catch(() => undefined);
-        }
+        await this.recordCompletion(node, "completed", output ?? "(no output)");
       }
     } catch (error) {
       if (node.interrupted) {
@@ -650,11 +833,7 @@ export class TeamManager {
       } else {
         const message = error instanceof Error ? error.message : String(error);
         node.status = { errored: message };
-        node.pausedTask = undefined;
-        this.recordRunState(node, "errored");
-        if (node.parent) {
-          await this.deliver(node.path, node.parent, "FINAL_ANSWER", `Agent error: ${message}`, false).catch(() => undefined);
-        }
+        await this.recordCompletion(node, "errored", `Agent error: ${message}`);
       }
     } finally {
       node.running = false;
@@ -727,7 +906,13 @@ export class TeamManager {
       agents: [...this.nodes.values()]
         .filter((node) => !resolvedPrefix || node.path === resolvedPrefix || node.path.startsWith(`${resolvedPrefix}/`))
         .sort((a, b) => a.path.localeCompare(b.path))
-        .map((node) => ({ agent_name: node.path, agent_status: node.status })),
+        .map((node) => ({
+          agent_name: node.path,
+          agent_status: node.status,
+          ...(node.path === ROOT ? {} : {
+            pending_notifications: [...this.pendingReports.values()].filter((item) => item.node === node).length,
+          }),
+        })),
     };
   }
 
@@ -957,6 +1142,8 @@ export class TeamManager {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.reportRetryTimer) clearInterval(this.reportRetryTimer);
+    this.reportRetryTimer = undefined;
     this.runQueue.length = 0;
     const children = [...this.nodes.values()].filter((node) => node.session || node.loadingSession);
     for (const node of children) {
