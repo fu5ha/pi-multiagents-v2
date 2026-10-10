@@ -89,11 +89,14 @@ export default function subagentsV2(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => team.start(ctx));
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt.includes("You are /root, the primary agent in a team of Pi agents.")
-      ? event.systemPrompt
-      : `${event.systemPrompt}\n\n${ROOT_INSTRUCTIONS}`,
-  }));
+  pi.on("before_agent_start", (event) => {
+    if (!pi.getActiveTools().includes("spawn_agent")) return;
+    return {
+      systemPrompt: event.systemPrompt.includes("You are /root, the primary agent in a team of Pi agents.")
+        ? event.systemPrompt
+        : `${event.systemPrompt}\n\n${ROOT_INSTRUCTIONS}`,
+    };
+  });
   pi.on("agent_start", () => team.setRootStatus("running"));
   pi.on("agent_settled", () => team.setRootStatus({ completed: null }));
   pi.on("input", (event) => {
